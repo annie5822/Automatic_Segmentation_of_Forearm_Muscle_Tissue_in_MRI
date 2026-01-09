@@ -1,0 +1,16 @@
+numpy==1.24.4
+opencv-python-headless==4.10.0.84
+PyQt5==5.15.9
+
+# 你的 viewer 程式本身沒 import Pillow，但 torchvision 常見會用到；
+# 且 Pillow 11 起不支援 Python 3.8，所以要加上限
+pillow>=9.0.0,<11.0.0  # 
+
+# 你的 viewer 程式本身沒 import tqdm / typing-extensions，但你清單有列就保留
+tqdm>=4.66.0
+typing-extensions>=4.8.0
+
+# PyTorch 對應版本（這組在 Python 3.8 是有 wheel 的）
+torch==2.2.2           # :contentReference[oaicite:2]{index=2}
+torchvision==0.17.2    # :contentReference[oaicite:3]{index=3}
+torchaudio==2.2.2      # :contentReference[oaicite:4]{index=4}
