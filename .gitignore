@@ -1,4 +1,5 @@
 venv/
 carpalTunnel/
 runs_transunet_ct_mn_ft/
+runs_transunet_mn/runs_transunet_ct_mn_ft/
 runs_transunet_mn/
