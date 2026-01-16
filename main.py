@@ -1,7 +1,10 @@
 # transunet_viewer_ct_mn_ft.py
 import sys
 import os
-from typing import Tuple, Optional
+import re
+import math
+import contextlib
+from typing import Tuple, Optional, Dict, Any, List
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFileDialog,
@@ -22,12 +25,21 @@ import torch.nn.functional as F
 SIZE = 350
 
 # =========================
-# TransUNet ckpt
+# CKPT paths (absolute from this .py)
 # =========================
-TRANSUNET_CKPT_PATH = "runs_transunet_ct_mn_ft/exp_20260104_235936/checkpoints/best_0.8445.pt"
-MN_TRANSUNET_CKPT_PATH = "runs_transunet_mn/exp_20260106_195827/checkpoints/best_0.7486.pt"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 推論用：固定使用 training 的 IMG_SIZE / IN_CHANNELS / OUT_CHANNELS
+TRANSUNET_CKPT_PATH = os.path.join(
+    BASE_DIR,
+    "runs_transunet_ct_mn_ft/exp_20260115_215111/checkpoints/best_0.8188.pt"
+)
+
+MN_TRANSUNET_CKPT_PATH = os.path.join(
+    BASE_DIR,
+    "runs_transunet_mn/exp_20260115_215915/checkpoints/best_0.7520.pt"
+)
+
+# 初始預設（若 ckpt 自動推回成功，這些會被覆寫）
 TRANSUNET_IMG_SIZE = (256, 256)   # (H, W)
 TRANSUNET_IN_CHANNELS = 2         # T1 + T2
 TRANSUNET_NUM_CLASSES = 3         # multi-label: 0=CT, 1=MN, 2=FT
@@ -43,10 +55,10 @@ MN_KEEP_ONE_COMPONENT = True
 MN_W_AREA = 0.1
 MN_W_TOP = 0.3
 MN_W_RIGHT = 0.3
-MN_MIN_AREA = 0  
+MN_MIN_AREA = 0
 
 CT_KEEP_ONE_COMPONENT = True
-CT_MIN_AREA = 200  # 小於這面積的連通元件直接丟掉；想更嚴格就加大（例如 500 / 1000）
+CT_MIN_AREA = 200  # 小於這面積的連通元件直接丟掉
 
 FT_FROM_CT_DARK_IN_T2_ENABLE = True
 FT_T2_MIN_PIXELS_IN_CT = 200
@@ -58,7 +70,7 @@ FT_T2_USE_SIGMOID_CONTRAST = True
 FT_T2_SIGMOID_K = 8.0  # 越大對比越強
 
 # 若不用 Sigmoid：改用線性對比
-FT_T2_LINEAR_ALPHA = 1.8  # 1.2~2.5
+FT_T2_LINEAR_ALPHA = 1.8
 FT_T2_LINEAR_BETA = 0.0
 
 # 用強化後的 ROI 取「暗」門檻：PCT=40 表示取最暗 40% 當 FT
@@ -73,26 +85,27 @@ FT_OPEN_K = 3
 FT_OPEN_IT = 1
 FT_CLOSE_K = 7
 FT_CLOSE_IT = 0
-FT_KEEP_LARGEST = False  # FT 可分成多塊，不要只留最大
+FT_KEEP_LARGEST = False
 
 # 若 CT 太小/估不到門檻 → 要不要回退用 model 的 FT
 FT_FALLBACK_TO_MODEL_IF_FAIL = True
 
 # ============================================================
-# CT pred 邊框太鋸齒 → 圓滑化 + anti-alias
+# CT contour smooth
 # ============================================================
 CT_CONTOUR_SMOOTH_ENABLE = True
-CT_CONTOUR_MEDIAN_K = 5          # 3/5/7... 越大越平滑
-CT_CONTOUR_CLOSE_K = 5           # close 讓邊緣比較連續
+CT_CONTOUR_MEDIAN_K = 5
+CT_CONTOUR_CLOSE_K = 5
 CT_CONTOUR_CLOSE_IT = 1
-CT_CONTOUR_EPS_RATIO = 0.003     # approxPolyDP 的 epsilon 比例：越大越圓滑
-CT_CONTOUR_THICKNESS = 1         # 紅線粗細
+CT_CONTOUR_EPS_RATIO = 0.003
+CT_CONTOUR_THICKNESS = 1
+
 
 # =========================
 # AMP compatibility helper
 # =========================
 try:
-    from torch import amp as _amp  # torch>=2.0
+    from torch import amp as _amp
     _HAS_TORCH_AMP = True
 except Exception:
     _HAS_TORCH_AMP = False
@@ -100,10 +113,21 @@ except Exception:
 
 
 def get_autocast(device_type: str, enabled: bool):
+    """
+    ✅ 修正：CPU 上不要硬開 cuda.amp.autocast，避免例外
+    """
+    if not enabled:
+        return contextlib.nullcontext()
+
     if _HAS_TORCH_AMP:
-        return _amp.autocast(device_type=device_type, enabled=enabled)
-    else:
-        return torch.cuda.amp.autocast(enabled=enabled)
+        # torch.amp.autocast supports device_type="cuda"/"cpu"
+        return _amp.autocast(device_type=device_type, enabled=True)
+
+    # fallback：沒有 torch.amp 就只支援 cuda autocast
+    if device_type == "cuda":
+        return torch.cuda.amp.autocast(enabled=True)
+
+    return contextlib.nullcontext()
 
 
 def make_image_box(size=SIZE):
@@ -211,7 +235,6 @@ def norm01_robust(img_u8: np.ndarray) -> np.ndarray:
     return img.astype(np.float32)
 
 
-
 def keep_one_component_largest(mask_u8: np.ndarray, min_area: int = 0) -> np.ndarray:
     m = (mask_u8 > 0).astype(np.uint8)
     if not np.any(m):
@@ -282,15 +305,8 @@ def _erode_mask(mask_u8: np.ndarray, k: int, it: int) -> np.ndarray:
     return (m > 0).astype(np.uint8)
 
 
-
 def _roi_robust_norm01(img_u8: np.ndarray, roi_mask_u8: np.ndarray,
                        p_low: float, p_high: float) -> Optional[Tuple[np.ndarray, float, float]]:
-    """
-    只在 ROI 內計算 percentile，回傳：
-      norm_img01 (float32, same shape),
-      lo, hi
-    若 ROI 太小/空，回 None
-    """
     roi = (roi_mask_u8 > 0)
     if not np.any(roi):
         return None
@@ -313,11 +329,6 @@ def _roi_robust_norm01(img_u8: np.ndarray, roi_mask_u8: np.ndarray,
 
 
 def _contrast_sigmoid(x01: np.ndarray, k: float) -> np.ndarray:
-    """
-    x01 in [0,1]
-    y = sigmoid(k*(x-0.5))
-    k 越大對比越強
-    """
     k = float(k)
     z = k * (x01.astype(np.float32) - 0.5)
     y = 1.0 / (1.0 + np.exp(-z))
@@ -325,10 +336,6 @@ def _contrast_sigmoid(x01: np.ndarray, k: float) -> np.ndarray:
 
 
 def _contrast_linear(x01: np.ndarray, alpha: float, beta: float = 0.0) -> np.ndarray:
-    """
-    y = clip((x-0.5)*alpha + 0.5 + beta, 0, 1)
-    alpha>1 對比更強
-    """
     a = float(alpha)
     b = float(beta)
     y = (x01.astype(np.float32) - 0.5) * a + 0.5 + b
@@ -363,16 +370,10 @@ def estimate_dark_thr_from_enhanced_t2_in_ct(enh_t2_u8: np.ndarray, ct_mask_u8: 
 
 
 def derive_ft_from_ct_dark_in_t2(t2_u8: np.ndarray, ct_mask_u8: np.ndarray) -> np.ndarray:
-    """
-    1) 取 CT ROI
-    2) 在 ROI 內把 T2 做對比強化
-    3) 用強化後 ROI 的 percentile 取暗部
-    """
     ct = (ct_mask_u8 > 0).astype(np.uint8)
     if not np.any(ct):
         return np.zeros_like(ct)
 
-    # 可選：CT 往內縮，避免邊界雜訊被選到 FT
     ct_inner = ct
     if FT_CT_ERODE_K > 0 and FT_CT_ERODE_IT > 0:
         ct_inner = _erode_mask(ct, FT_CT_ERODE_K, FT_CT_ERODE_IT)
@@ -389,7 +390,6 @@ def derive_ft_from_ct_dark_in_t2(t2_u8: np.ndarray, ct_mask_u8: np.ndarray) -> n
 
     ft = ((enh.astype(np.float32) <= thr) & (ct_inner > 0)).astype(np.uint8)
 
-    # 清理
     ft = _morph_open_close(ft, FT_OPEN_K, FT_OPEN_IT, FT_CLOSE_K, FT_CLOSE_IT)
 
     if FT_KEEP_LARGEST:
@@ -398,19 +398,11 @@ def derive_ft_from_ct_dark_in_t2(t2_u8: np.ndarray, ct_mask_u8: np.ndarray) -> n
     return (ft > 0).astype(np.uint8)
 
 
-
 def keep_one_component_weighted(mask_u8: np.ndarray,
                                 w_area: float = 0.5,
                                 w_top: float = 0.25,
                                 w_right: float = 0.25,
                                 min_area: int = 30) -> np.ndarray:
-    """
-    在連通元件中只保留一塊：
-      score = w_area * area_norm + w_top * topness + w_right * rightness
-      - area_norm：area / max_area
-      - topness：  1 - cy/(H-1)     (越靠上越好)
-      - rightness：cx/(W-1)         (越靠右越好)
-    """
     m = (mask_u8 > 0).astype(np.uint8)
     if not np.any(m):
         return m
@@ -457,7 +449,217 @@ def keep_one_component_weighted(mask_u8: np.ndarray,
 
 
 # ============================================================
-# TransUNet (CNN encoder + Transformer bottleneck + UNet decoder)
+# ✅ ckpt state_dict 對齊工具
+# ============================================================
+def _strip_known_prefixes(sd: Dict[str, torch.Tensor], prefixes: List[str]) -> Dict[str, torch.Tensor]:
+    if not isinstance(sd, dict) or not sd:
+        return sd
+
+    out = sd
+    for p in prefixes:
+        keys = list(out.keys())
+        if not keys:
+            break
+        cnt = sum(1 for k in keys if isinstance(k, str) and k.startswith(p))
+        if cnt >= int(0.8 * len(keys)):
+            out = {k[len(p):]: v for k, v in out.items() if isinstance(k, str)}
+    return out
+
+
+def _extract_state_dict_and_cfg(ck: Any) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, Any]]]:
+    cfg = None
+    if isinstance(ck, dict):
+        cfg = ck.get("cfg", None)
+        if "model_state" in ck and isinstance(ck["model_state"], dict):
+            sd = ck["model_state"]
+        elif "state_dict" in ck and isinstance(ck["state_dict"], dict):
+            sd = ck["state_dict"]
+        elif "model_state_dict" in ck and isinstance(ck["model_state_dict"], dict):
+            sd = ck["model_state_dict"]
+        else:
+            maybe_sd = {k: v for k, v in ck.items() if isinstance(v, torch.Tensor)}
+            sd = maybe_sd if maybe_sd else ck
+    else:
+        sd = ck
+
+    if not isinstance(sd, dict):
+        raise ValueError("Checkpoint is not a state_dict-like object.")
+
+    sd = _strip_known_prefixes(sd, prefixes=["module.", "model.", "net."])
+    return sd, (cfg if isinstance(cfg, dict) else None)
+
+
+def _find_key_endswith(sd: Dict[str, torch.Tensor], suffix: str) -> Optional[str]:
+    for k in sd.keys():
+        if isinstance(k, str) and k.endswith(suffix):
+            return k
+    return None
+
+
+def _infer_trans_blocks(sd: Dict[str, torch.Tensor], prefix: str = "trans_blocks.") -> int:
+    max_i = -1
+    pat = re.compile(r".*" + re.escape(prefix) + r"(\d+)\.")
+    for k in sd.keys():
+        if not isinstance(k, str):
+            continue
+        m = pat.match(k)
+        if m:
+            idx = int(m.group(1))
+            max_i = max(max_i, idx)
+    return max_i + 1 if max_i >= 0 else 0
+
+
+def _factorize_token_len(L: int) -> Tuple[int, int]:
+    """
+    把 token_len L 分解成 (h, w) 最接近 sqrt 的一組
+    """
+    L = int(L)
+    if L <= 0:
+        return 16, 16
+    r = int(np.sqrt(L))
+    for h in range(r, 0, -1):
+        if L % h == 0:
+            w = L // h
+            return int(h), int(w)
+    return r, max(1, L // max(1, r))
+
+
+def _pick_heads(embed_dim: int, preferred: int = 8) -> int:
+    embed_dim = int(embed_dim)
+    preferred = int(max(1, preferred))
+    if embed_dim % preferred == 0:
+        return preferred
+    for h in [8, 6, 4, 3, 2, 1, 12, 16]:
+        if embed_dim % h == 0:
+            return int(h)
+    return 1
+
+
+def _is_vit_transunet_ckpt(sd: Dict[str, torch.Tensor]) -> bool:
+    if _find_key_endswith(sd, "patch_proj.weight") is not None:
+        return True
+    if _find_key_endswith(sd, "bridge.net.0.weight") is not None:
+        return True
+    if _find_key_endswith(sd, "pos_embed") is not None and any(isinstance(k, str) and k.startswith("trans_blocks.") for k in sd.keys()):
+        return True
+    return False
+
+
+def _infer_vittransunet_cfg_from_ckpt(
+    sd: Dict[str, torch.Tensor],
+    cfg: Optional[Dict[str, Any]],
+    default_img_size=(256, 256),
+    default_heads=8,
+    default_mlp_ratio=4.0,
+    default_dropout=0.1,
+) -> Dict[str, Any]:
+    """
+    ✅ 修正重點：
+    - 回傳 dict 一定包含：
+      POS_HW / PATCH_IN_CH / BRIDGE_OUT_CH / BRIDGE_K
+    - 這樣 load_transunet_once() 不會再 KeyError
+    """
+
+    # base + in_ch
+    k_d1 = _find_key_endswith(sd, "d1.net.0.weight")
+    if k_d1 is None:
+        raise KeyError("Cannot find key 'd1.net.0.weight' in checkpoint state_dict.")
+    w_d1 = sd[k_d1]
+    base = int(w_d1.shape[0])
+    in_ch = int(w_d1.shape[1])
+
+    # out channels
+    k_out = _find_key_endswith(sd, "out.weight")
+    if k_out is None:
+        raise KeyError("Cannot find key 'out.weight' in checkpoint state_dict.")
+    out_ch = int(sd[k_out].shape[0])
+
+    # vit_dim from patch_proj
+    k_pp = _find_key_endswith(sd, "patch_proj.weight")
+    if k_pp is None:
+        raise KeyError("Cannot find key 'patch_proj.weight' in checkpoint state_dict.")
+    vit_dim = int(sd[k_pp].shape[0])
+
+    # patch_in_ch from patch_proj input
+    patch_in_ch = int(sd[k_pp].shape[1])
+
+    # vit_depth from trans_blocks
+    vit_depth = _infer_trans_blocks(sd, prefix="trans_blocks.")
+    if vit_depth <= 0:
+        raise KeyError("Cannot infer vit_depth: no trans_blocks.* found in ckpt.")
+
+    # img size from cfg OR pos_embed length
+    img_size = tuple(default_img_size)
+
+    # 如果 training cfg 裡面有 IMG_SIZE → 直接用（最準）
+    if isinstance(cfg, dict) and "IMG_SIZE" in cfg:
+        v = cfg["IMG_SIZE"]
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            img_size = (int(v[0]), int(v[1]))
+
+    # 否則用 pos_embed 的 token_len 推回 (H/16,W/16)
+    k_pe = _find_key_endswith(sd, "pos_embed")
+    if k_pe is not None and not (isinstance(cfg, dict) and "IMG_SIZE" in cfg):
+        token_len = int(sd[k_pe].shape[1])
+        ph, pw = _factorize_token_len(token_len)   # (H/16, W/16)
+        img_size = (int(ph * 16), int(pw * 16))
+
+    # heads/mlp/dropout/thr from cfg (training keys)
+    if isinstance(cfg, dict):
+        vit_heads = int(cfg.get("VIT_HEADS", default_heads))
+        vit_mlp_ratio = float(cfg.get("VIT_MLP_RATIO", default_mlp_ratio))
+        vit_dropout = float(cfg.get("VIT_DROPOUT", default_dropout))
+
+        thr_ct = float(cfg.get("THR_CT", TRANSUNET_THR_CT))
+        thr_mn = float(cfg.get("THR_MN", TRANSUNET_THR_MN))
+        thr_ft = float(cfg.get("THR_FT", TRANSUNET_THR_FT))
+    else:
+        vit_heads = int(default_heads)
+        vit_mlp_ratio = float(default_mlp_ratio)
+        vit_dropout = float(default_dropout)
+        thr_ct, thr_mn, thr_ft = TRANSUNET_THR_CT, TRANSUNET_THR_MN, TRANSUNET_THR_FT
+
+    vit_heads = _pick_heads(vit_dim, preferred=vit_heads)
+
+    # ✅ POS_HW 一定要補：它就是 H/16, W/16
+    pos_hw = (int(img_size[0] // 16), int(img_size[1] // 16))
+
+    # ✅ bridge kernel/out_ch：從 bridge.net.0.weight 推（推不到就用預設）
+    bridge_out_ch = int(vit_dim)
+    bridge_k = 3
+    k_b0 = _find_key_endswith(sd, "bridge.net.0.weight")
+    if k_b0 is not None:
+        wb = sd[k_b0]
+        if hasattr(wb, "shape") and len(wb.shape) == 4:
+            bridge_out_ch = int(wb.shape[0])
+            bridge_k = int(wb.shape[2])
+
+    return {
+        "IMG_SIZE": (int(img_size[0]), int(img_size[1])),
+        "IN_CHANNELS": int(in_ch),
+        "OUT_CHANNELS": int(out_ch),
+        "BASE": int(base),
+
+        "VIT_DIM": int(vit_dim),
+        "VIT_DEPTH": int(vit_depth),
+        "VIT_HEADS": int(vit_heads),
+        "VIT_MLP_RATIO": float(vit_mlp_ratio),
+        "VIT_DROPOUT": float(vit_dropout),
+
+        # ✅ 這些是你一直缺的 key
+        "PATCH_IN_CH": int(patch_in_ch),
+        "POS_HW": (int(pos_hw[0]), int(pos_hw[1])),
+        "BRIDGE_OUT_CH": int(bridge_out_ch),
+        "BRIDGE_K": int(bridge_k),
+
+        "THR_CT": float(thr_ct),
+        "THR_MN": float(thr_mn),
+        "THR_FT": float(thr_ft),
+    }
+
+
+# ============================================================
+# Model blocks  (MATCH train_transunet_ct_mn_ft_weighted.py)
 # ============================================================
 class DoubleConv(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -466,6 +668,7 @@ class DoubleConv(nn.Module):
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
+
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
@@ -476,7 +679,12 @@ class DoubleConv(nn.Module):
 
 
 class TransformerEncoderBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+    """
+    Same as training:
+    LN → MHA → residual
+    LN → MLP → residual
+    """
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
@@ -500,21 +708,40 @@ class TransformerEncoderBlock(nn.Module):
         return x
 
 
-class TransUNet(nn.Module):
+class ViTTransUNet(nn.Module):
+    """
+    EXACT SAME as train_transunet_ct_mn_ft_weighted.py
+    Keys will match:
+      d1.*, d2.*, d3.*, d4.*,
+      patch_proj.*,
+      pos_embed,
+      trans_blocks.*,
+      bridge.net.*,
+      u4.*, c4.net.*,
+      u3.*, c3.net.*,
+      u2.*, c2.net.*,
+      u1.*, c1.net.*,
+      out.*
+    """
     def __init__(
         self,
         in_ch: int = 2,
         out_ch: int = 3,
         base: int = 32,
         img_size: Tuple[int, int] = (256, 256),
-        trans_layers: int = 2,
-        trans_heads: int = 4,
-        trans_mlp_ratio: float = 4.0,
-        trans_dropout: float = 0.1,
+        vit_dim: int = 512,
+        vit_depth: int = 6,
+        vit_heads: int = 8,
+        vit_mlp_ratio: float = 4.0,
+        vit_dropout: float = 0.1,
     ):
         super().__init__()
-        self.img_size = img_size
+        self.img_size = (int(img_size[0]), int(img_size[1]))
+        self.base = int(base)
 
+        assert vit_dim % vit_heads == 0, f"vit_dim({vit_dim}) must be divisible by vit_heads({vit_heads})."
+
+        # CNN Encoder
         self.d1 = DoubleConv(in_ch, base)
         self.p1 = nn.MaxPool2d(2)
         self.d2 = DoubleConv(base, base * 2)
@@ -522,41 +749,49 @@ class TransUNet(nn.Module):
         self.d3 = DoubleConv(base * 2, base * 4)
         self.p3 = nn.MaxPool2d(2)
         self.d4 = DoubleConv(base * 4, base * 8)
-        self.p4 = nn.MaxPool2d(2)
+        self.p4 = nn.MaxPool2d(2)  # H/16
 
-        self.mid = DoubleConv(base * 8, base * 16)
+        # Patch embedding
+        self.patch_proj = nn.Conv2d(base * 8, vit_dim, kernel_size=1, bias=True)
 
-        self.embed_dim = base * 16
-        h16 = img_size[0] // 16
-        w16 = img_size[1] // 16
-        self.token_len = h16 * w16
+        h16 = self.img_size[0] // 16
+        w16 = self.img_size[1] // 16
+        self.token_len = int(h16 * w16)
+        self.vit_dim = int(vit_dim)
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.token_len, self.embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.token_len, vit_dim))
+        self.drop = nn.Dropout(vit_dropout)
 
         self.trans_blocks = nn.ModuleList([
             TransformerEncoderBlock(
-                dim=self.embed_dim,
-                num_heads=trans_heads,
-                mlp_ratio=trans_mlp_ratio,
-                dropout=trans_dropout
+                dim=vit_dim,
+                num_heads=vit_heads,
+                mlp_ratio=vit_mlp_ratio,
+                dropout=vit_dropout
             )
-            for _ in range(trans_layers)
+            for _ in range(vit_depth)
         ])
 
-        self.u4 = nn.ConvTranspose2d(base * 16, base * 8, 2, stride=2)
+        # Bridge (DoubleConv)
+        self.bridge = DoubleConv(vit_dim, vit_dim)
+
+        # UNet Decoder
+        self.u4 = nn.ConvTranspose2d(vit_dim, base * 8, 2, stride=2)
         self.c4 = DoubleConv(base * 16, base * 8)
+
         self.u3 = nn.ConvTranspose2d(base * 8, base * 4, 2, stride=2)
         self.c3 = DoubleConv(base * 8, base * 4)
+
         self.u2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
         self.c2 = DoubleConv(base * 4, base * 2)
+
         self.u1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
         self.c1 = DoubleConv(base * 2, base)
 
-        self.out = nn.Conv2d(base, out_ch, 1)
+        self.out = nn.Conv2d(base, out_ch, kernel_size=1, bias=True)
 
     def _to_tokens(self, feat: torch.Tensor) -> torch.Tensor:
-        return feat.flatten(2).transpose(1, 2)
+        return feat.flatten(2).transpose(1, 2)  # (N, H*W, D)
 
     def _to_feat(self, tokens: torch.Tensor, h: int, w: int) -> torch.Tensor:
         return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], h, w)
@@ -566,28 +801,36 @@ class TransUNet(nn.Module):
         d2 = self.d2(self.p1(d1))
         d3 = self.d3(self.p2(d2))
         d4 = self.d4(self.p3(d3))
-        mid = self.mid(self.p4(d4))
 
-        n, d, h, w = mid.shape
-        tokens = self._to_tokens(mid)
+        f = self.p4(d4)          # (N, base*8, H/16, W/16)
+        f = self.patch_proj(f)   # (N, vit_dim, H/16, W/16)
 
-        if tokens.shape[1] == self.token_len:
+        n, d, h, w = f.shape
+        tokens = self._to_tokens(f)  # (N, L, D)
+
+        # pos embedding (safe fallback interpolate)
+        if tokens.shape[1] == self.pos_embed.shape[1]:
             tokens = tokens + self.pos_embed
         else:
-            pe = self.pos_embed
-            L0 = pe.shape[1]
-            s0 = int(np.sqrt(L0))
-            pe2 = pe.transpose(1, 2).reshape(1, d, s0, s0)
+            # ✅ 修正：不要假設 pos_embed 一定是 square
+            pe = self.pos_embed  # (1, L0, D)
+            L0 = int(pe.shape[1])
+            ph0, pw0 = _factorize_token_len(L0)  # (H0, W0)
+
+            pe2 = pe.transpose(1, 2).reshape(1, d, ph0, pw0)
             pe2 = F.interpolate(pe2, size=(h, w), mode="bilinear", align_corners=False)
             pe2 = pe2.flatten(2).transpose(1, 2)
             tokens = tokens + pe2
 
+        tokens = self.drop(tokens)
+
         for blk in self.trans_blocks:
             tokens = blk(tokens)
 
-        mid_t = self._to_feat(tokens, h, w)
+        feat = self._to_feat(tokens, h, w)
+        feat = self.bridge(feat)
 
-        x = self.u4(mid_t)
+        x = self.u4(feat)
         x = torch.cat([x, d4], dim=1)
         x = self.c4(x)
 
@@ -606,40 +849,50 @@ class TransUNet(nn.Module):
         return self.out(x)
 
 
+# ============================================================
+# Global models
+# ============================================================
 TRANS_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-TRANS_MODEL = None
 
+TRANS_MODEL = None
+TRANS_MODEL_KIND = None
 
 _TRANS_IMG_SIZE = TRANSUNET_IMG_SIZE
 _TRANS_IN_CH = TRANSUNET_IN_CHANNELS
 _TRANS_OUT_CH = TRANSUNET_NUM_CLASSES
-_TRANS_LAYERS = 2
-_TRANS_HEADS = 4
-_TRANS_MLP = 4.0
-_TRANS_DROP = 0.1
 _TRANS_BASE = TRANSUNET_BASE
 
+_TRANS_VIT_DIM = 512
+_TRANS_VIT_DEPTH = 2
+_TRANS_VIT_HEADS = 8
+_TRANS_VIT_MLP = 4.0
+_TRANS_VIT_DROP = 0.1
+_TRANS_POS_HW = (TRANSUNET_IMG_SIZE[0] // 16, TRANSUNET_IMG_SIZE[1] // 16)
+
+_TRANS_BRIDGE_OUT = 512
+_TRANS_BRIDGE_K = 3
+_TRANS_PATCH_IN = TRANSUNET_BASE * 8
 
 _THR_CT = TRANSUNET_THR_CT
 _THR_MN = TRANSUNET_THR_MN
 _THR_FT = TRANSUNET_THR_FT
 
-
 MN_MODEL = None
 _MN_IMG_SIZE = (256, 256)
 _MN_IN_CH = 2
 _MN_OUT_CH = 1
-_MN_LAYERS = 2
-_MN_HEADS = 4
-_MN_MLP = 4.0
-_MN_DROP = 0.1
 _MN_BASE = TRANSUNET_BASE
 _MN_THR = 0.5
 
 
 def load_transunet_once():
-    global TRANS_MODEL
-    global _TRANS_IMG_SIZE, _TRANS_IN_CH, _TRANS_OUT_CH, _TRANS_LAYERS, _TRANS_HEADS, _TRANS_MLP, _TRANS_DROP, _TRANS_BASE
+    """
+    ✅ 自動判斷 ViTTransUNet ckpt 並自動推回必要參數
+    """
+    global TRANS_MODEL, TRANS_MODEL_KIND
+    global _TRANS_IMG_SIZE, _TRANS_IN_CH, _TRANS_OUT_CH, _TRANS_BASE, _TRANS_POS_HW
+    global _TRANS_VIT_DIM, _TRANS_VIT_DEPTH, _TRANS_VIT_HEADS, _TRANS_VIT_MLP, _TRANS_VIT_DROP
+    global _TRANS_BRIDGE_OUT, _TRANS_BRIDGE_K, _TRANS_PATCH_IN
     global _THR_CT, _THR_MN, _THR_FT
 
     if TRANS_MODEL is not None:
@@ -649,159 +902,69 @@ def load_transunet_once():
         raise FileNotFoundError(f"TransUNet ckpt not found: {TRANSUNET_CKPT_PATH}")
 
     ck = torch.load(TRANSUNET_CKPT_PATH, map_location=TRANS_DEVICE)
+    sd, cfg = _extract_state_dict_and_cfg(ck)
 
-    cfg = None
-    if isinstance(ck, dict):
-        cfg = ck.get("cfg", None)
+    if not _is_vit_transunet_ckpt(sd):
+        raise RuntimeError("This viewer version expects ViTTransUNet ckpt, but the ckpt looks different.")
 
-    if isinstance(cfg, dict):
-        img_size = cfg.get("IMG_SIZE", _TRANS_IMG_SIZE)
-        if isinstance(img_size, (list, tuple)) and len(img_size) == 2:
-            _TRANS_IMG_SIZE = (int(img_size[0]), int(img_size[1]))
+    TRANS_MODEL_KIND = "vit"
+    auto = _infer_vittransunet_cfg_from_ckpt(
+        sd=sd,
+        cfg=cfg,
+        default_img_size=_TRANS_IMG_SIZE,
+        default_heads=_TRANS_VIT_HEADS,
+        default_mlp_ratio=_TRANS_VIT_MLP,
+        default_dropout=_TRANS_VIT_DROP,
+    )
 
-        _TRANS_IN_CH = int(cfg.get("IN_CHANNELS", _TRANS_IN_CH))
-        _TRANS_OUT_CH = int(cfg.get("OUT_CHANNELS", _TRANS_OUT_CH))
+    # ✅ 一定有這些 key（已在 infer 函式補齊）
+    _TRANS_IMG_SIZE = tuple(auto["IMG_SIZE"])
+    _TRANS_IN_CH = int(auto["IN_CHANNELS"])
+    _TRANS_OUT_CH = int(auto["OUT_CHANNELS"])
+    _TRANS_BASE = int(auto["BASE"])
+    _TRANS_PATCH_IN = int(auto["PATCH_IN_CH"])
 
-        _TRANS_LAYERS = int(cfg.get("TRANS_NUM_LAYERS", _TRANS_LAYERS))
-        _TRANS_HEADS = int(cfg.get("TRANS_NUM_HEADS", _TRANS_HEADS))
-        _TRANS_MLP = float(cfg.get("TRANS_MLP_RATIO", _TRANS_MLP))
-        _TRANS_DROP = float(cfg.get("TRANS_DROPOUT", _TRANS_DROP))
+    _TRANS_VIT_DIM = int(auto["VIT_DIM"])
+    _TRANS_VIT_DEPTH = int(auto["VIT_DEPTH"])
+    _TRANS_VIT_HEADS = int(auto["VIT_HEADS"])
+    _TRANS_VIT_MLP = float(auto["VIT_MLP_RATIO"])
+    _TRANS_VIT_DROP = float(auto["VIT_DROPOUT"])
+    _TRANS_POS_HW = tuple(auto["POS_HW"])
 
-        if "THR_CT" in cfg:
-            _THR_CT = float(cfg["THR_CT"])
-        if "THR_MN" in cfg:
-            _THR_MN = float(cfg["THR_MN"])
-        if "THR_FT" in cfg:
-            _THR_FT = float(cfg["THR_FT"])
+    _TRANS_BRIDGE_OUT = int(auto["BRIDGE_OUT_CH"])
+    _TRANS_BRIDGE_K = int(auto["BRIDGE_K"])
 
-        _TRANS_BASE = TRANSUNET_BASE
+    _THR_CT = float(auto["THR_CT"])
+    _THR_MN = float(auto["THR_MN"])
+    _THR_FT = float(auto["THR_FT"])
 
-    model = TransUNet(
+    model = ViTTransUNet(
         in_ch=_TRANS_IN_CH,
         out_ch=_TRANS_OUT_CH,
         base=_TRANS_BASE,
         img_size=_TRANS_IMG_SIZE,
-        trans_layers=_TRANS_LAYERS,
-        trans_heads=_TRANS_HEADS,
-        trans_mlp_ratio=_TRANS_MLP,
-        trans_dropout=_TRANS_DROP,
+        vit_dim=_TRANS_VIT_DIM,
+        vit_depth=_TRANS_VIT_DEPTH,
+        vit_heads=_TRANS_VIT_HEADS,
+        vit_mlp_ratio=_TRANS_VIT_MLP,
+        vit_dropout=_TRANS_VIT_DROP,
     ).to(TRANS_DEVICE)
     model.eval()
 
-    sd = ck["model_state"] if (isinstance(ck, dict) and "model_state" in ck) else ck
     model.load_state_dict(sd, strict=True)
-
     TRANS_MODEL = model
-    print(f"[TransUNet] loaded: {TRANSUNET_CKPT_PATH}")
-    print(f"[TransUNet] device: {TRANS_DEVICE}")
-    print(f"[TransUNet] img_size={_TRANS_IMG_SIZE} in_ch={_TRANS_IN_CH} out_ch={_TRANS_OUT_CH}")
-    print(f"[TransUNet] trans: layers={_TRANS_LAYERS} heads={_TRANS_HEADS} mlp={_TRANS_MLP} drop={_TRANS_DROP}")
-    print(f"[TransUNet] thr(CT,MN,FT)=({_THR_CT},{_THR_MN},{_THR_FT})")
 
-
-def load_mn_transunet_once():
-    global MN_MODEL
-    global _MN_IMG_SIZE, _MN_IN_CH, _MN_OUT_CH, _MN_LAYERS, _MN_HEADS, _MN_MLP, _MN_DROP, _MN_BASE, _MN_THR
-
-    if MN_MODEL is not None:
-        return
-
-    if not os.path.isfile(MN_TRANSUNET_CKPT_PATH):
-        # 只影響 MN；不動其它流程
-        print(f"[MN-TransUNet] ckpt not found, fallback to multi-label MN: {MN_TRANSUNET_CKPT_PATH}")
-        MN_MODEL = None
-        return
-
-    ck = torch.load(MN_TRANSUNET_CKPT_PATH, map_location=TRANS_DEVICE)
-
-    cfg = None
-    if isinstance(ck, dict):
-        cfg = ck.get("cfg", None)
-
-    if isinstance(cfg, dict):
-        img_size = cfg.get("IMG_SIZE", _MN_IMG_SIZE)
-        if isinstance(img_size, (list, tuple)) and len(img_size) == 2:
-            _MN_IMG_SIZE = (int(img_size[0]), int(img_size[1]))
-
-        _MN_IN_CH = int(cfg.get("IN_CHANNELS", _MN_IN_CH))
-        _MN_OUT_CH = int(cfg.get("OUT_CHANNELS", _MN_OUT_CH))
-
-        _MN_LAYERS = int(cfg.get("TRANS_NUM_LAYERS", _MN_LAYERS))
-        _MN_HEADS = int(cfg.get("TRANS_NUM_HEADS", _MN_HEADS))
-        _MN_MLP = float(cfg.get("TRANS_MLP_RATIO", _MN_MLP))
-        _MN_DROP = float(cfg.get("TRANS_DROPOUT", _MN_DROP))
-
-        # MN-only training script: cfg.THR
-        if "THR" in cfg:
-            _MN_THR = float(cfg["THR"])
-
-        _MN_BASE = TRANSUNET_BASE
-
-    model = TransUNet(
-        in_ch=_MN_IN_CH,
-        out_ch=_MN_OUT_CH,
-        base=_MN_BASE,
-        img_size=_MN_IMG_SIZE,
-        trans_layers=_MN_LAYERS,
-        trans_heads=_MN_HEADS,
-        trans_mlp_ratio=_MN_MLP,
-        trans_dropout=_MN_DROP,
-    ).to(TRANS_DEVICE)
-    model.eval()
-
-    sd = ck["model_state"] if (isinstance(ck, dict) and "model_state" in ck) else ck
-    model.load_state_dict(sd, strict=True)
-
-    MN_MODEL = model
-    print(f"[MN-TransUNet] loaded: {MN_TRANSUNET_CKPT_PATH}")
-    print(f"[MN-TransUNet] device: {TRANS_DEVICE}")
-    print(f"[MN-TransUNet] img_size={_MN_IMG_SIZE} in_ch={_MN_IN_CH} out_ch={_MN_OUT_CH}")
-    print(f"[MN-TransUNet] trans: layers={_MN_LAYERS} heads={_MN_HEADS} mlp={_MN_MLP} drop={_MN_DROP}")
-    print(f"[MN-TransUNet] thr(MN)={_MN_THR}")
+    print(f"[ViTTransUNet] loaded: {TRANSUNET_CKPT_PATH}")
+    print(f"[ViTTransUNet] device: {TRANS_DEVICE}")
+    print(f"[ViTTransUNet] img_size={_TRANS_IMG_SIZE} base={_TRANS_BASE} in_ch={_TRANS_IN_CH} out_ch={_TRANS_OUT_CH}")
+    print(f"[ViTTransUNet] patch_in={_TRANS_PATCH_IN} vit_dim={_TRANS_VIT_DIM} depth={_TRANS_VIT_DEPTH} heads={_TRANS_VIT_HEADS}")
+    print(f"[ViTTransUNet] pos_hw={_TRANS_POS_HW}")
+    print(f"[ViTTransUNet] bridge_out={_TRANS_BRIDGE_OUT} bridge_k={_TRANS_BRIDGE_K}")
+    print(f"[ViTTransUNet] thr(CT,MN,FT)=({_THR_CT},{_THR_MN},{_THR_FT})")
 
 
 @torch.no_grad()
-def mn_transunet_predict_mask(t1_u8: np.ndarray, t2_u8: np.ndarray) -> Optional[np.ndarray]:
-    """
-    回傳 MN mask（shape: (H,W) uint8 {0,1}），大小是 _MN_IMG_SIZE
-    若 MN ckpt 不存在 → 回 None（caller fallback）
-    """
-    load_mn_transunet_once()
-    if MN_MODEL is None:
-        return None
-
-    Hm, Wm = _MN_IMG_SIZE
-    t1_rs = cv2.resize(t1_u8, (Wm, Hm), interpolation=cv2.INTER_LINEAR)
-    t2_rs = cv2.resize(t2_u8, (Wm, Hm), interpolation=cv2.INTER_LINEAR)
-
-    t1_n = norm01_robust(t1_rs)
-    t2_n = norm01_robust(t2_rs)
-
-    x = np.stack([t1_n, t2_n], axis=0)  # (2,H,W)
-    x = torch.from_numpy(x).unsqueeze(0).to(TRANS_DEVICE)  # (1,2,H,W)
-
-    use_amp = bool(TRANSUNET_MIXED_PRECISION and TRANS_DEVICE.type == "cuda")
-    with get_autocast(device_type=TRANS_DEVICE.type, enabled=use_amp):
-        logits = MN_MODEL(x)          # (1,1,H,W)
-        probs = torch.sigmoid(logits) # (1,1,H,W)
-        pred = (probs >= float(_MN_THR)).float()
-
-    mn = pred.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.uint8)  # (H,W)
-    return mn
-
-
-@torch.no_grad()
-def transunet_predict_multilabel_masks(
-    t1_u8: np.ndarray,
-    t2_u8: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    input: t1_u8,t2_u8 shape (SIZE,SIZE) uint8
-    output: ct, mn, ft masks (each shape (SIZE,SIZE) uint8 in {0,1})
-
-    channel define:
-      0 = CT, 1 = MN, 2 = FT
-    """
+def transunet_predict_multilabel_masks(t1_u8: np.ndarray, t2_u8: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     load_transunet_once()
 
     Hm, Wm = _TRANS_IMG_SIZE
@@ -817,7 +980,7 @@ def transunet_predict_multilabel_masks(
     use_amp = bool(TRANSUNET_MIXED_PRECISION and TRANS_DEVICE.type == "cuda")
     with get_autocast(device_type=TRANS_DEVICE.type, enabled=use_amp):
         logits = TRANS_MODEL(x)       # (1,3,H,W)
-        probs = torch.sigmoid(logits) # (1,3,H,W)
+        probs = torch.sigmoid(logits)
 
         pred = torch.zeros_like(probs)
         pred[:, 0] = (probs[:, 0] >= _THR_CT).float()
@@ -825,19 +988,13 @@ def transunet_predict_multilabel_masks(
         pred[:, 2] = (probs[:, 2] >= _THR_FT).float()
 
     pred_small = pred.squeeze(0).detach().cpu().numpy().astype(np.uint8)  # (3,H,W)
-
     ct_s = pred_small[0]
     mn_s = pred_small[1]
     ft_s = pred_small[2]
 
-    mn_from_mn_ckpt = mn_transunet_predict_mask(t1_u8, t2_u8)
-    if mn_from_mn_ckpt is not None:
-        mn_s = cv2.resize(mn_from_mn_ckpt, (Wm, Hm), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
-
     ct = cv2.resize(ct_s, (SIZE, SIZE), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
     mn = cv2.resize(mn_s, (SIZE, SIZE), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
     ft = cv2.resize(ft_s, (SIZE, SIZE), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
-
     return ct, mn, ft
 
 
@@ -873,11 +1030,14 @@ def safe_sort_numeric_first(files):
     return sorted(files, key=key)
 
 
+# ============================================================
+# UI
+# ============================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Segmentation Viewer (TransUNet + CT keep one + FT from T2(CT ROI) dark)")
+        self.setWindowTitle("Segmentation Viewer (ViTTransUNet bridge fixed)")
         self.resize(1300, 700)
 
         self.t1_images = []
@@ -943,7 +1103,7 @@ class MainWindow(QMainWindow):
         h2.addWidget(self.lbl_filename)
         left_layout.addLayout(h2)
 
-        # ========== 右邊：Tabs + CT/FT/MN ==========
+        # ========== 右邊：Tabs ==========
         right_box = QGroupBox()
         right_layout = QVBoxLayout(right_box)
 
@@ -1054,11 +1214,9 @@ class MainWindow(QMainWindow):
             img = cv2.resize(img, size, interpolation=cv2.INTER_NEAREST)
             mask_bin = (img > 127).astype(np.uint8)
 
-            # 載入 GT 時也刪除小點，只留一塊
             if kind == "CT" and CT_KEEP_ONE_COMPONENT:
                 mask_bin = keep_one_component_largest(mask_bin, min_area=CT_MIN_AREA)
 
-            # 載入 GT 時也做清理
             if kind == "MN" and MN_KEEP_ONE_COMPONENT:
                 mask_bin = keep_one_component_weighted(mask_bin, MN_W_AREA, MN_W_TOP, MN_W_RIGHT, MN_MIN_AREA)
 
@@ -1194,23 +1352,11 @@ class MainWindow(QMainWindow):
             dice_label.setText(dice_text)
 
     def predict_all(self):
-
         size = (SIZE, SIZE)
 
         if not self.t1_images or not self.t2_images:
             QMessageBox.warning(self, "缺資料", "請先載入 T1 folder 與 T2 folder")
             return
-
-        has_any_gt = (len(self.gt_masks["CT"]) > 0) or (len(self.gt_masks["FT"]) > 0) or (len(self.gt_masks["MN"]) > 0)
-        if not has_any_gt:
-            ans = QMessageBox.question(
-                self,
-                "未載入 GT",
-                "你目前沒有載入任何 GT mask（CT/FT/MN）。\n仍要執行 Predict 並只顯示 pred 嗎？",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if ans != QMessageBox.Yes:
-                return
 
         try:
             for kind in ["CT", "FT", "MN"]:
@@ -1236,16 +1382,13 @@ class MainWindow(QMainWindow):
 
                     ct_pred, ft_model_pred, mn_pred = predict_masks_transunet(t1_img, t2_img)
 
-                    # binarize
                     ct_pred = (ct_pred > 0).astype(np.uint8)
                     ft_model_pred = (ft_model_pred > 0).astype(np.uint8)
                     mn_pred = (mn_pred > 0).astype(np.uint8)
 
-                    # --- CT：刪小點，只留一塊 ---
                     if CT_KEEP_ONE_COMPONENT:
                         ct_pred = keep_one_component_largest(ct_pred, min_area=CT_MIN_AREA)
 
-                    # --- FT：用「T2 的 CT ROI」強化後取暗部 → 取代 model 的 FT ---
                     if FT_FROM_CT_DARK_IN_T2_ENABLE:
                         ft_ct = derive_ft_from_ct_dark_in_t2(t2_img, ct_pred)
                         if np.any(ft_ct):
@@ -1255,7 +1398,6 @@ class MainWindow(QMainWindow):
                     else:
                         ft_pred = ft_model_pred
 
-                    # --- MN：score = 0.5 size + 0.25 top + 0.25 right，只留一塊 ---
                     if MN_KEEP_ONE_COMPONENT:
                         mn_pred = keep_one_component_weighted(mn_pred, MN_W_AREA, MN_W_TOP, MN_W_RIGHT, MN_MIN_AREA)
 
@@ -1285,9 +1427,8 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     try:
         load_transunet_once()
-        load_mn_transunet_once()
     except Exception as e:
-        print("[TransUNet] load failed:", e)
+        print("[Model] load failed:", e)
 
     app = QApplication(sys.argv)
     w = MainWindow()

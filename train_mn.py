@@ -35,7 +35,6 @@ def get_autocast(device_type: str, enabled: bool):
 def get_grad_scaler(device_type: str, enabled: bool):
     if _HAS_TORCH_AMP and hasattr(_amp, "GradScaler"):
         return _amp.GradScaler(device_type=device_type, enabled=enabled)
-
     return torch.cuda.amp.GradScaler(enabled=bool(enabled and device_type == "cuda"))
 
 
@@ -75,12 +74,13 @@ class CFG:
     SAVE_TEST_VIS: bool = True
 
     # =========================
-    # TransUNet config
+    # ✅ ViT-TransUNet config (Hybrid)  <<< 跟你新的模型一致
     # =========================
-    TRANS_NUM_LAYERS: int = 2
-    TRANS_NUM_HEADS: int = 4
-    TRANS_MLP_RATIO: float = 4.0
-    TRANS_DROPOUT: float = 0.1
+    VIT_EMBED_DIM: int = 512
+    VIT_DEPTH: int = 6
+    VIT_HEADS: int = 8
+    VIT_MLP_RATIO: float = 4.0
+    VIT_DROPOUT: float = 0.1
 
     # =========================
     # Loss (binary)
@@ -260,10 +260,8 @@ class CarpalTunnelMNSegDataset(Dataset):
     def _load_mask(self, item) -> np.ndarray:
         H, W = self.cfg.IMG_SIZE
         y = np.zeros((1, H, W), dtype=np.uint8)
-
         m = resize_hw(imread_gray(item["mn"]), self.cfg.IMG_SIZE, is_mask=True)
         y[0] = binarize_mask(m)
-
         return y.astype(np.float32)
 
     def __getitem__(self, idx: int):
@@ -282,8 +280,8 @@ class CarpalTunnelMNSegDataset(Dataset):
 
             # mild brightness/contrast
             if np.random.rand() < 0.35:
-                a = np.random.uniform(0.9, 1.1)    # contrast
-                b = np.random.uniform(-0.05, 0.05) # brightness
+                a = np.random.uniform(0.9, 1.1)     # contrast
+                b = np.random.uniform(-0.05, 0.05)  # brightness
                 x = np.clip(a * x + b, 0.0, 1.0)
 
         return torch.from_numpy(x), torch.from_numpy(y).float(), {
@@ -294,7 +292,7 @@ class CarpalTunnelMNSegDataset(Dataset):
 
 
 # ============================================================
-# TransUNet
+# ✅ ViT-TransUNet (Hybrid): CNN skip + ViT encoder + UNet decoder
 # ============================================================
 class DoubleConv(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -313,6 +311,11 @@ class DoubleConv(nn.Module):
 
 
 class TransformerEncoderBlock(nn.Module):
+    """
+    標準 ViT encoder block:
+    - LN → MHA → residual
+    - LN → MLP → residual
+    """
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -337,81 +340,117 @@ class TransformerEncoderBlock(nn.Module):
         return x
 
 
-class TransUNet(nn.Module):
+class ViTTransUNet(nn.Module):
+    """
+    ViT-TransUNet（Hybrid）架構：
+    - CNN Encoder：抽多尺度特徵，提供 UNet skip connections
+    - Tokenization：取最底層 feature map (H/16, W/16)，用 1x1 conv 投影成 token dim
+    - ViT Encoder：對 tokens 做 global self-attention
+    - UNet Decoder：逐層 upsample + concat(skip) + conv
+    """
     def __init__(
         self,
         in_ch: int = 2,
         out_ch: int = 1,
         base: int = 32,
         img_size: Tuple[int, int] = (256, 256),
-        trans_layers: int = 2,
-        trans_heads: int = 4,
-        trans_mlp_ratio: float = 4.0,
-        trans_dropout: float = 0.1,
+        vit_dim: int = 512,
+        vit_depth: int = 6,
+        vit_heads: int = 8,
+        vit_mlp_ratio: float = 4.0,
+        vit_dropout: float = 0.1,
     ):
         super().__init__()
         self.img_size = img_size
+        self.base = base
 
-        self.d1 = DoubleConv(in_ch, base)
+        assert vit_dim % vit_heads == 0, f"VIT_EMBED_DIM({vit_dim}) must be divisible by VIT_HEADS({vit_heads})."
+
+        # -------------------------
+        # CNN Encoder (skip features)
+        # -------------------------
+        self.d1 = DoubleConv(in_ch, base)          # 256x256
         self.p1 = nn.MaxPool2d(2)
-        self.d2 = DoubleConv(base, base * 2)
+        self.d2 = DoubleConv(base, base * 2)       # 128x128
         self.p2 = nn.MaxPool2d(2)
-        self.d3 = DoubleConv(base * 2, base * 4)
+        self.d3 = DoubleConv(base * 2, base * 4)   # 64x64
         self.p3 = nn.MaxPool2d(2)
-        self.d4 = DoubleConv(base * 4, base * 8)
-        self.p4 = nn.MaxPool2d(2)
+        self.d4 = DoubleConv(base * 4, base * 8)   # 32x32
+        self.p4 = nn.MaxPool2d(2)                  # 16x16
 
-        self.mid = DoubleConv(base * 8, base * 16)
+        # -------------------------
+        # Patch embedding (tokenize)
+        # from feature map (N, base*8, H/16, W/16) -> (N, vit_dim, H/16, W/16)
+        # -------------------------
+        self.patch_proj = nn.Conv2d(base * 8, vit_dim, kernel_size=1, bias=True)
 
-        self.embed_dim = base * 16
         h16 = img_size[0] // 16
         w16 = img_size[1] // 16
         self.token_len = h16 * w16
+        self.vit_dim = vit_dim
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.token_len, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.token_len, vit_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        self.drop = nn.Dropout(vit_dropout)
 
         self.trans_blocks = nn.ModuleList([
             TransformerEncoderBlock(
-                dim=self.embed_dim,
-                num_heads=trans_heads,
-                mlp_ratio=trans_mlp_ratio,
-                dropout=trans_dropout
+                dim=vit_dim,
+                num_heads=vit_heads,
+                mlp_ratio=vit_mlp_ratio,
+                dropout=vit_dropout
             )
-            for _ in range(trans_layers)
+            for _ in range(vit_depth)
         ])
 
-        self.u4 = nn.ConvTranspose2d(base * 16, base * 8, 2, stride=2)
-        self.c4 = DoubleConv(base * 16, base * 8)
-        self.u3 = nn.ConvTranspose2d(base * 8, base * 4, 2, stride=2)
-        self.c3 = DoubleConv(base * 8, base * 4)
-        self.u2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
-        self.c2 = DoubleConv(base * 4, base * 2)
-        self.u1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
-        self.c1 = DoubleConv(base * 2, base)
+        # optional bridge conv
+        self.bridge = DoubleConv(vit_dim, vit_dim)
+
+        # -------------------------
+        # UNet Decoder
+        # -------------------------
+        self.u4 = nn.ConvTranspose2d(vit_dim, base * 8, 2, stride=2)    # 16->32
+        self.c4 = DoubleConv(base * 16, base * 8)                      # cat with d4
+
+        self.u3 = nn.ConvTranspose2d(base * 8, base * 4, 2, stride=2)  # 32->64
+        self.c3 = DoubleConv(base * 8, base * 4)                       # cat with d3
+
+        self.u2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)  # 64->128
+        self.c2 = DoubleConv(base * 4, base * 2)                       # cat with d2
+
+        self.u1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)      # 128->256
+        self.c1 = DoubleConv(base * 2, base)                           # cat with d1
 
         self.out = nn.Conv2d(base, out_ch, 1)
 
     def _to_tokens(self, feat: torch.Tensor) -> torch.Tensor:
-        return feat.flatten(2).transpose(1, 2)  # (N, H*W, D)
+        # feat: (N, D, H, W) -> (N, H*W, D)
+        return feat.flatten(2).transpose(1, 2)
 
     def _to_feat(self, tokens: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        # tokens: (N, H*W, D) -> (N, D, H, W)
         return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], h, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d1 = self.d1(x)
-        d2 = self.d2(self.p1(d1))
-        d3 = self.d3(self.p2(d2))
-        d4 = self.d4(self.p3(d3))
-        mid = self.mid(self.p4(d4))  # (N, D, H/16, W/16)
+        # CNN encoder
+        d1 = self.d1(x)             # (N, base, 256,256)
+        d2 = self.d2(self.p1(d1))   # (N, base*2,128,128)
+        d3 = self.d3(self.p2(d2))   # (N, base*4,64,64)
+        d4 = self.d4(self.p3(d3))   # (N, base*8,32,32)
 
-        n, d, h, w = mid.shape
-        tokens = self._to_tokens(mid)
+        # tokenize from lowest feature map
+        f = self.p4(d4)             # (N, base*8,16,16)
+        f = self.patch_proj(f)      # (N, vit_dim,16,16)
 
+        n, d, h, w = f.shape
+        tokens = self._to_tokens(f)  # (N, 256, vit_dim)
+
+        # add pos embedding
         if tokens.shape[1] == self.token_len:
             tokens = tokens + self.pos_embed
         else:
-            # fallback: interpolate pos embedding
+            # fallback: interpolate pos_embed
             pe = self.pos_embed
             L0 = pe.shape[1]
             s0 = int(np.sqrt(L0))
@@ -420,25 +459,31 @@ class TransUNet(nn.Module):
             pe2 = pe2.flatten(2).transpose(1, 2)
             tokens = tokens + pe2
 
+        tokens = self.drop(tokens)
+
+        # ViT encoder
         for blk in self.trans_blocks:
             tokens = blk(tokens)
 
-        mid_t = self._to_feat(tokens, h, w)
+        # reshape back to feature map
+        feat = self._to_feat(tokens, h, w)  # (N, vit_dim,16,16)
+        feat = self.bridge(feat)
 
-        x = self.u4(mid_t)
-        x = torch.cat([x, d4], dim=1)
+        # UNet decoder + skip
+        x = self.u4(feat)                   # (N, base*8,32,32)
+        x = torch.cat([x, d4], dim=1)       # (N, base*16,32,32)
         x = self.c4(x)
 
-        x = self.u3(x)
-        x = torch.cat([x, d3], dim=1)
+        x = self.u3(x)                      # (N, base*4,64,64)
+        x = torch.cat([x, d3], dim=1)       # (N, base*8,64,64)
         x = self.c3(x)
 
-        x = self.u2(x)
-        x = torch.cat([x, d2], dim=1)
+        x = self.u2(x)                      # (N, base*2,128,128)
+        x = torch.cat([x, d2], dim=1)       # (N, base*4,128,128)
         x = self.c2(x)
 
-        x = self.u1(x)
-        x = torch.cat([x, d1], dim=1)
+        x = self.u1(x)                      # (N, base,256,256)
+        x = torch.cat([x, d1], dim=1)       # (N, base*2,256,256)
         x = self.c1(x)
 
         return self.out(x)
@@ -524,6 +569,7 @@ def overlay_mask_on_gray(gray01: np.ndarray, y1: np.ndarray, alpha=0.45) -> np.n
 # =========================
 def build_sampler_weights(train_items: List[Dict[str, str]], cfg: CFG) -> np.ndarray:
     w = np.ones(len(train_items), dtype=np.float64)
+    pos_cnt = 0
     for i, it in enumerate(train_items):
         mn_path = it.get("mn", "")
         is_pos = False
@@ -532,8 +578,12 @@ def build_sampler_weights(train_items: List[Dict[str, str]], cfg: CFG) -> np.nda
             m = resize_hw(m, cfg.IMG_SIZE, is_mask=True)
             m = binarize_mask(m)
             is_pos = bool(np.any(m))
-
+        if is_pos:
+            pos_cnt += 1
         w[i] *= float(cfg.SAMPLE_MUL_POS if is_pos else cfg.SAMPLE_MUL_NEG)
+
+    # 小提醒：如果 pos_cnt 很少，MN 很容易學成全 0（你遇到的症狀）
+    print(f"[sampler] MN positive slices in train_items: {pos_cnt}/{len(train_items)} = {pos_cnt/max(1,len(train_items)):.3f}")
     return w
 
 
@@ -635,11 +685,12 @@ def main():
     # threshold
     parser.add_argument("--thr", type=float, default=CFG.THR)
 
-    # trans config
-    parser.add_argument("--tlayers", type=int, default=CFG.TRANS_NUM_LAYERS)
-    parser.add_argument("--theads", type=int, default=CFG.TRANS_NUM_HEADS)
-    parser.add_argument("--tmlp", type=float, default=CFG.TRANS_MLP_RATIO)
-    parser.add_argument("--tdrop", type=float, default=CFG.TRANS_DROPOUT)
+    # ✅ ViT config (跟你的新模型一致)
+    parser.add_argument("--tdim", type=int, default=CFG.VIT_EMBED_DIM)
+    parser.add_argument("--tlayers", type=int, default=CFG.VIT_DEPTH)
+    parser.add_argument("--theads", type=int, default=CFG.VIT_HEADS)
+    parser.add_argument("--tmlp", type=float, default=CFG.VIT_MLP_RATIO)
+    parser.add_argument("--tdrop", type=float, default=CFG.VIT_DROPOUT)
 
     # loss
     parser.add_argument("--no_bce", action="store_true")
@@ -666,10 +717,11 @@ def main():
 
     cfg.THR = float(args.thr)
 
-    cfg.TRANS_NUM_LAYERS = int(args.tlayers)
-    cfg.TRANS_NUM_HEADS = int(args.theads)
-    cfg.TRANS_MLP_RATIO = float(args.tmlp)
-    cfg.TRANS_DROPOUT = float(args.tdrop)
+    cfg.VIT_EMBED_DIM = int(args.tdim)
+    cfg.VIT_DEPTH = int(args.tlayers)
+    cfg.VIT_HEADS = int(args.theads)
+    cfg.VIT_MLP_RATIO = float(args.tmlp)
+    cfg.VIT_DROPOUT = float(args.tdrop)
 
     cfg.USE_BCE = (not args.no_bce)
     cfg.DICE_LOSS_WEIGHT = float(args.dice_w)
@@ -691,7 +743,7 @@ def main():
     print(f"[cfg] train={cfg.TRAIN_SUBSETS} test={cfg.TEST_SUBSETS} val={cfg.VAL_SUBSETS} (val fallback: split 10%)")
     print(f"[cfg] img_size={cfg.IMG_SIZE} in_ch={cfg.IN_CHANNELS} out_ch={cfg.OUT_CHANNELS} amp={cfg.MIXED_PRECISION}")
     print(f"[cfg] thr(MN)={cfg.THR}")
-    print(f"[cfg] TransUNet: layers={cfg.TRANS_NUM_LAYERS} heads={cfg.TRANS_NUM_HEADS} mlp_ratio={cfg.TRANS_MLP_RATIO} drop={cfg.TRANS_DROPOUT}")
+    print(f"[cfg] ViT: dim={cfg.VIT_EMBED_DIM} depth={cfg.VIT_DEPTH} heads={cfg.VIT_HEADS} mlp_ratio={cfg.VIT_MLP_RATIO} drop={cfg.VIT_DROPOUT}")
     print(f"[cfg] USE_BCE={cfg.USE_BCE} dice_w={cfg.DICE_LOSS_WEIGHT} bce_w={cfg.BCE_LOSS_WEIGHT} pos_weight={cfg.BCE_POS_WEIGHT}")
     print(f"[cfg] USE_SAMPLER={cfg.USE_SAMPLER} SAMPLE_MUL(pos,neg)=({cfg.SAMPLE_MUL_POS},{cfg.SAMPLE_MUL_NEG})")
 
@@ -735,15 +787,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device}")
 
-    model = TransUNet(
+    model = ViTTransUNet(
         in_ch=cfg.IN_CHANNELS,
         out_ch=cfg.OUT_CHANNELS,
         base=32,
         img_size=cfg.IMG_SIZE,
-        trans_layers=cfg.TRANS_NUM_LAYERS,
-        trans_heads=cfg.TRANS_NUM_HEADS,
-        trans_mlp_ratio=cfg.TRANS_MLP_RATIO,
-        trans_dropout=cfg.TRANS_DROPOUT,
+        vit_dim=cfg.VIT_EMBED_DIM,
+        vit_depth=cfg.VIT_DEPTH,
+        vit_heads=cfg.VIT_HEADS,
+        vit_mlp_ratio=cfg.VIT_MLP_RATIO,
+        vit_dropout=cfg.VIT_DROPOUT,
     ).to(device)
 
     loss_fn = DiceBCELossBinary(
@@ -791,7 +844,7 @@ def main():
                     "epoch": ep,
                     "best_score": best_score,
                     "model_state": model.state_dict(),
-                    "model_name": "TransUNet(MN-only)",
+                    "model_name": "ViTTransUNet(MN-only)",
                 },
                 best_path,
             )
@@ -813,7 +866,7 @@ def main():
             "epoch": cfg.EPOCHS,
             "best_score": best_score,
             "model_state": model.state_dict(),
-            "model_name": "TransUNet(MN-only)",
+            "model_name": "ViTTransUNet(MN-only)",
         },
         last_path,
     )
